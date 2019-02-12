@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+##
+#             (C) 2002-2019, R-fx Networks <proj@rfxn.com>
+#             (C) 2019, Ryan MacDonald <ryan@rfxn.com>
+# This program may be freely redistributed under the terms of the GNU GPL v2
+##
+
+pages_shared=`cat /sys/kernel/mm/ksm/pages_shared`;
+pages_sharing=`cat /sys/kernel/mm/ksm/pages_sharing`;
+pages_unshared=`cat /sys/kernel/mm/ksm/pages_unshared`;
+pages_volatile=`cat /sys/kernel/mm/ksm/pages_volatile`;
+page_size=`getconf PAGESIZE`;
+
+ratio_sharing_to_shared=$(echo "scale=2;$pages_sharing / $pages_shared"|bc 2> /dev/null);
+ratio_unshared_to_sharing=$(echo "scale=2;$pages_unshared / $pages_sharing"|bc 2> /dev/null);
+saved=$(echo "scale=0;$pages_sharing * $page_size"|bc 2> /dev/null);
+
+saved=$(expr $saved / 1048576);
+
+printf "Shared\tSharing\tUnshared\tVolatile\tSharing:Shared\tUnshared:Sharing\tSaved\n";
+printf "%'d\t%'d\t%'d\t\t%'d\t\t%'f:1\t%'f:1\t\t%'dM\n" $pages_shared $pages_sharing $pages_unshared $pages_volatile $ratio_sharing_to_shared $ratio_unshared_to_sharing $saved;

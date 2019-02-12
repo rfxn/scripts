@@ -1,7 +1,7 @@
 #!/bin/bash
 ##
-# 	(C) 2002-2014, R-fx Networks <proj@rfxn.com>
-# 	(C) 2014, Ryan MacDonald <ryan@rfxn.com>
+#             (C) 2002-2019, R-fx Networks <proj@rfxn.com>
+#             (C) 2019, Ryan MacDonald <ryan@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
 # Generate change logs with comparative execution against

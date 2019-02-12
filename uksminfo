@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+##
+#             (C) 2002-2019, R-fx Networks <proj@rfxn.com>
+#             (C) 2019, Ryan MacDonald <ryan@rfxn.com>
+# This program may be freely redistributed under the terms of the GNU GPL v2
+##
+
+if [ -d "/sys/kernel/mm/uksm" ]; then
+
+	if [ "$1" ]; then
+	        echo $1 > /proc/sys/vm/drop_caches
+	fi
+        memused=`free -om | grep Mem | awk '{print$3}'`
+        memrss=`echo "($(ps -A -o 'rss' --no-headers | paste -sd+)) / 1024" | bc`
+
+        full_scans=`cat /sys/kernel/mm/uksm/full_scans`
+        page_size=`getconf PAGESIZE`
+        pages_scanned=`cat /sys/kernel/mm/uksm/pages_scanned`
+        pages_shared=`cat /sys/kernel/mm/uksm/pages_shared`
+        pages_sharing=`cat /sys/kernel/mm/uksm/pages_sharing`
+
+	uksm_page_ratio=`echo "scale=2; $pages_sharing / $pages_shared" | bc`
+        uksm_mem_ratio=`echo "scale=2; $memrss / $memused"  |bc`
+        uksm_perceff=`echo "scale=4 ; ($memrss - $memused) / (($memused + $memrss)/2) * 100" | bc -l`
+        uksm_cpugov=`cat /sys/kernel/mm/uksm/cpu_governor | tr ' ' '\n' | grep "\[" | tr -d '[]'`
+        uksm_sleep=`cat /sys/kernel/mm/uksm/sleep_millisecs`
+        uksm_maxcpu=`cat /sys/kernel/mm/uksm/max_cpu_percentage`
+        uksm_run=`cat /sys/kernel/mm/uksm/run`
+
+        echo -e "uKSMinfo\nRunEnabled:\t $uksm_run\nCpuGovernor:\t $uksm_cpugov\nCpuMaxUse%:\t $uksm_maxcpu\nSleepMs:\t $uksm_sleep\nFullScans:\t $full_scans\nPageSize:\t $page_size\nPagesScanned:\t $pages_scanned\nPagesShared:\t $pages_shared\nPagesSharing:\t $pages_sharing\nSharingToShared: ${uksm_page_ratio}:1\nPhyMemUse:\t $memused\nRssMemUse:\t $memrss\nRssToPhys:\t ${uksm_mem_ratio}:1\nMergePageEff:\t ${uksm_perceff:0:5}%"
+else
+        echo "uKSM not enabled in kernel, nothing to do here."
+fi
+
