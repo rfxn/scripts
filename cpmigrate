@@ -1,1 +1,1596 @@
-/root/admin/work/downloads/cpmigrate
+#!/bin/sh
+#
+##
+# cPanel Migrate (cpmigrate) v2.3
+#      Copyright (C) 2012-2016, Ryan MacDonald <ryan@rfxn.com>
+##
+#
+
+# arcfour cipher provides basic encryption and 4-6x speed over default
+# preferred cipher ordering on large dataset transfers
+ssh_opts="-o Compression=no -o StrictHostKeyChecking=no -T -c arcfour -x"
+
+# can add --skipacctdb if source side has mysql issues and then sync
+# over mysql at a later point; yes we want 5.1 dumps for greatest import
+# compatibility
+pkgopts='--compressed --mysql 5.1 --skipbwdata'
+
+# home directory path, typically /home
+local_homedir="/home"
+pkgpath="$local_homedir"
+# path that pkgacct files are written to locally
+pkgstore="$local_homedir/cpmigrate"
+# max load before pkgacct is paused remote side
+pkgload="20"
+
+# critical disk space usage; all cpmigrate tasks after this point will fail
+# this is checked against on partitions housing / and /var
+crit_diskuse="95"
+
+# nothing else should need editing below this
+# don't touch, mmkay?
+timeout_time="90"
+mysql_sizematch_toleranceperc=2
+newshell=""
+rsync_homedir="0"
+rsync_excludes='--exclude=error_log --exclude=backup-*.tar.gz --exclude=backup-*.zip --exclude=softaculous_backups --exclude=php.ini'
+exclude_largeusr="0"
+exclude_largeusr_msize="25000"
+mysqldb_max_msize="4000"
+restoreopts=""
+logdir="/var/log/cpmigrate"
+log="$logdir/cpmigrate.log"
+nc=`which nc 2> /dev/null`
+timeout=`which timeout 2> /dev/null`
+tmpdir="/root/tmp/cpmigrate"
+tmp="$tmpdir/tmp.$$"
+runtime_userlist="/root/.cpmigrate.users"
+runtime_mysqllist="/root/.cpmigrate.mysqldbs"
+ver="2.3"
+export PATH=/sbin:/bin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin
+
+##
+# we cannot teach people anything; we can only help them discover it themselves.
+##
+
+if [ ! -d "$tmpdir" ]; then
+	mkdir -p $tmpdir 2> /dev/null
+	chmod 700 $tmpdir
+fi
+
+if [ ! -d "$pkgstore" ]; then
+	mkdir -p $pkgstore 2> /dev/null
+	chmod 700 $pkgstore
+fi
+
+if [ -f "$timeout" ]; then
+	timeout_prefix="$timeout $timeout_time"
+else
+	timeout_prefix=""
+fi
+
+eout() {
+	msg=$1
+	opt=$2
+	if [ "$opt" ]; then
+		echo "$(date +"%b %e %H:%M:%S") $(hostname -s) cpmigrate[$$]: $msg" >> $log
+		echo "$(date +"%b %e %H:%M:%S"): $msg"
+	else
+		echo "$(date +"%b %e %H:%M:%S") $(hostname -s) cpmigrate[$$]: $msg" >> $log
+	fi
+}
+
+log_state() {
+	utime=`date +'%s'`
+	migratestate_log="$logdir/migrate.states"
+	userstate_log="$logdir/user.states"
+	if [ ! -f "$migratestate_log" ]; then
+		touch $migratestate_log
+		chmod 644 $migratestate_log
+	fi
+	if [ ! -f "$userstate_log" ]; then
+		touch $userstate_log
+		chmod 644 $userstate_log
+	fi
+	type="$1"
+	if [ "$type" == "migrate" ]; then
+		pid="$2"
+		server="$3"
+		status="$4"
+		sed -i "/^$pid/d" $migratestate_log
+		echo "$pid $utime $server $status" >> $migratestate_log
+	elif [ "$type" == "user" ]; then
+		server="$2"
+		user="$3"
+		status="$4"
+		sed -i "/.*$server.*$user.*/d" $userstate_log
+		echo "$utime $server $user $status" >> $userstate_log
+	fi
+}
+
+# log_state "migrate" "$$" "$sourcehost" ""
+# log_state "user" "$sourcehost" "$user" ""
+
+prerun() {
+	if [ -f "/root/stopcpmigrate" ]; then
+		eout "[prerun] error: detected /root/stopcpmigrate, please remove before running cpmigrate!" 1
+		rm -f $tmp*
+		exit 1
+	fi
+	
+	if [ "$1" == "diff" ]; then
+		diff=1
+	elif [ "$1" == "mysqlonly" ]; then
+		mysqlonly=1
+	elif [ "$1" == "rsyncusers" ]; then
+		rsyncusers=1
+	elif [ "$1" == "nomigrate" ]; then
+		nomigrate=1
+	elif [ "$1" == "bg" ]; then
+		background=1
+	fi
+	
+	# debug cli
+	#echo "host $sourcehost | port $sourceport | list $userlist | large $exclude_largeusr $exclude_largeusr_msize | rsync $rsync_homedir | pkg $pkgopts | rst $restoreopts | skipacl $skipacl"
+	#exit
+	
+	if [ ! -d "/root/tmp" ]; then
+		mkdir -p /root/tmp
+	fi
+	
+	if [ -f "/tmp/.cpmigrate.lock" ]; then
+		echo "error: cpmigrate usage currently locked, try again in a few minutes, aborting!"
+		rm -f ${tmp}.*
+		exit 1
+	fi
+	
+	if [ -z "$sourcehost" ] || [ -z "$sourceport" ]; then
+		echo "error: no host and/or port defined, aborting!"
+		exit 1
+	else
+		runtime_userlist="${runtime_userlist}.${sourcehost}"
+		runtime_mysqllist="${runtime_mysqllist}.${sourcehost}"
+	fi
+	
+	if [ ! -d "/var/cpanel" ] && [ ! -f "/var/cpanel/cpanel.config" ]; then
+		echo "error: this does not appear to be a cpanel server, aborting!"
+		exit 1
+	fi
+	
+	if [ -z "$nc" ]; then
+		echo "error: nc binary (netcat) not found, aborting!"
+		exit 1
+	fi
+	
+	if [ ! -d "$logdir" ]; then
+		mkdir -p $logdir
+		chmod 755 $logdir
+	fi
+
+	if [ ! -f "$log" ]; then
+		touch $log
+		touch $log.full
+		chmod 644 $log $log.full
+	fi
+	
+	ln -fs $log /root/
+	ln -fs $log.full /root/
+	ln -fs $log /var/log/
+	ln -fs $log.full /var/log/
+	
+	if [ ! -f "$runtime_userlist" ]; then
+		touch $runtime_userlist
+	fi
+	if [ ! -f "$runtime_mysqllist" ]; then
+		touch $runtime_mysqllist
+	fi
+	
+	$nc -w2 -z $sourcehost $sourceport >> /dev/null 2>&1
+	if [ ! "$?" == "0" ]; then
+		echo "error: could not connect to source ssh port on $sourcehost:$sourceport, aborting!"
+		log_state "migrate" "$$" "$sourcehost" "prerun: connection error $sourcehost:$sourceport"
+		exit 1
+	fi
+	
+	keyval=`ssh -p $sourceport root@$sourcehost $ssh_opts "echo 'cpmigrate' > /tmp/.cpmigrate ; cat /tmp/.cpmigrate ; rm -f /tmp/.cpmigrate" | grep cpmigrate`
+	if [ ! "$keyval" == "cpmigrate" ]; then
+		echo "error: could not validate ssh key relationship with $sourcehost:$sourceport, aborting!"
+		log_state "migrate" "$$" "$sourcehost" "prerun: connection error $sourcehost:$sourceport"
+		exit 1
+	fi
+	
+	mysql --defaults-extra-file=/root/.my.cnf --connect-timeout=5 -e "show processlist" >> /dev/null 2>&1 && mysqlreturn="$?"
+	if [ ! "$mysqlreturn" == "0" ]; then
+		echo "error: could not complete local MySQL test query, please check that the MySQL service is online and responding, aborting!"
+		log_state "migrate" "$$" "$sourcehost" "prerun: mysql test on localhost failed"
+		exit 1
+	fi
+	
+	remote_mysqlreturn=`ssh -p $sourceport root@$sourcehost $ssh_opts "mysql --defaults-extra-file=/root/.my.cnf --connect-timeout=5 -e 'show processlist' >> /dev/null 2>&1 && echo '$?'"`
+	if [ ! "$remote_mysqlreturn" == "0" ]; then
+		echo "error: could not complete remote MySQL test query on $sourcehost, please check that the MySQL service is online and responding, aborting!"
+		log_state "migrate" "$$" "$sourcehost" "prerun: mysql test on $sourcehost failed"
+		exit 1
+	fi
+	
+	if [ "$rsync_homedir" == "1" ]; then
+		pkgopts="$pkgopts --skiphomedir"
+	fi
+	
+	mkdir -p $logdir/$sourcehost 2> /dev/null
+
+	local_users="${tmp}.localusr"
+	find /var/cpanel/users -type f | sed 's_/var/cpanel/users/__' | sort > $local_users
+	
+	mailserver=`cat /var/cpanel/cpanel.config | grep mailserver | cut -d'=' -f2`
+	if [ -z "$mailserver" ]; then
+		mailserver=dovecot
+	fi
+	
+	remote_users="${tmp}.remoteusr"
+	if [ ! "$userlist" ]; then
+		## why are we building a passwd and var/cpanel user list together?
+		## different versions of cpanel have different term/suspend semantics
+		## and if we validate users in var/cpanel against passwd we know with
+		## relative confidence its an accurate user list of "valid" linux accounts
+		ssh -p $sourceport root@$sourcehost $ssh_opts "awk -F':' '{ if (\$3 > 499) print \$1 }' /etc/passwd" 2> $log.full | sort > $remote_users.passwd
+		ssh -p $sourceport root@$sourcehost $ssh_opts "find /var/cpanel/users -type f | sed 's_/var/cpanel/users/__'" 2> $log.full | sort > $remote_users.pull
+		ssh -p $sourceport root@$sourcehost $ssh_opts "grep IP= /var/cpanel/users/* | sed -e 's_IP=__' -e 's_/var/cpanel/users/__'" > $remote_users.ipmap
+
+	        cat $local_users | egrep -wf $remote_users.passwd > $logdir/$sourcehost/${sourcehost}.duplicates
+                rm -f $remote.users.exclude && touch $remote.users.exclude
+                if [ "$exclude_suspended" ]; then
+                        ssh -p $sourceport root@$sourcehost $ssh_opts "egrep SUSPENDED=1 /var/cpanel/users/* | tr '/:' ' ' | awk '{print\$4}'" > $remote.users.suspended
+                        cat $remote.users.suspended | sort | uniq | egrep -v '^$' > $remote.users.exclude
+                fi
+                if [ -f "$exclude_list" ]; then
+                        cat $exclude_list | sort | uniq | egrep -v '^$' >> $remote.users.exclude
+                fi
+                cat $remote.users.exclude | sort | uniq | egrep -v '^$' > $remote.users.exclude.$$
+                mv -f $remote.users.exclude.$$ $remote.users.exclude
+                cat $remote_users.pull | grep -wf $remote_users.passwd | egrep -vwf $remote.users.exclude > $remote_users
+
+		if [ ! -f "$remote_users.ipmap" ]; then
+			touch $remote_users.ipmap
+		fi
+	else
+		cat $userlist | cut -d':' -f1 > $remote_users
+                cat $local_users | egrep -wf $remote_users > $logdir/$sourcehost/${sourcehost}.duplicates
+		ssh -p $sourceport root@$sourcehost $ssh_opts "grep IP= /var/cpanel/users/* | sed -e 's_IP=__' -e 's_/var/cpanel/users/__'" > $remote_users.ipmap
+	fi
+
+
+        ## grab user homedirs so we can rsync from the correct paths
+        ssh -p $sourceport root@$sourcehost $ssh_opts "awk -F':' '{ if (\$3 > 499) print \$1,\$6 }' /etc/passwd" 2> $log.full | tr '/' ' ' | awk '{print$1" /"$2}' | sort > $remote_users.homedirs
+	
+	if [ "$exclude_largeusr" == "1" ]; then
+		ssh -p $sourceport root@$sourcehost $ssh_opts "wget -t3 -T3 http://129.121.132.46/downloads/dfq -O /usr/local/sbin/dfq ; chmod 755 /usr/local/sbin/dfq" >> $log.full 2>&1
+		exclude_largeusr_list="${tmp}.largeusr"
+		ssh -p $sourceport root@$sourcehost $ssh_opts "/usr/local/sbin/dfq all 25 | grep -v MBUSE | tr -d 'M'" 2> $log.full > $exclude_largeusr_list
+	fi
+	
+	migrate_users="${tmp}.users"
+	if [ "$userlist" ] || [ "$ipmap_file" ] || [ "$jdi" ] && [ "$trustme" ]; then
+		cat $remote_users > $migrate_users
+	else
+		cat $remote_users | grep -vwf $local_users > $migrate_users
+	fi
+	total_source_users=`cat $remote_users | wc -l`
+	migrate_users_count=`cat $migrate_users | wc -l`
+	
+	if [ "$mysqlonly" ]; then
+		touch /tmp/.cpmigrate.lock
+                eout "[mysqlsync] generating mysql database cache informatinon from $sourcehost and local, this can take a few minutes." 1
+		# yes this really is the best way to do this and no don't start querying schema for db sizes
+		find /var/lib/mysql/ -maxdepth 1 -type d | egrep -vw '^/var/lib/mysql/$|mysql/mysql|information_schema|cphulkd|eximstats|horde|mailmon|modsec|munin_innodb|performance_schema|roundcube|whmxfer|leechprotect|Database|test_mysqldiff' | sort | grep -vE '^$' | xargs -I{} du -sk {} | sed 's_/var/lib/mysql/__' > ${tmp}.mysqldbs.local
+		ssh -p $sourceport root@$sourcehost $ssh_opts "find /var/lib/mysql/ -maxdepth 1 -type d | egrep -vw '^/var/lib/mysql/$|mysql/mysql|information_schema|cphulkd|eximstats|horde|mailmon|modsec|munin_innodb|performance_schema|roundcube|whmxfer|leechprotect|Database|test_mysqldiff' | sort | grep -vE '^$' | xargs -I{} du -sk {} | sed 's_/var/lib/mysql/__'"  2> $log.full > ${tmp}.mysqldbs.remote
+		rm -f /tmp/.cpmigrate.lock
+	fi
+	
+	if [ -z "$diff" ] && [ -z "$mysqlonly" ] && [ -z "$rsyncusers" ] && [ -z "$nomigrate" ]; then
+		if [ "$background" ]; then
+			echo "Migration task pushed into background, tracking enabled through $log."
+			migrate >> $log.full &
+		else
+			migrate
+		fi
+	fi
+}
+
+copy_cpinfo() {
+	sdir="$logdir/$sourcehost"
+	mkdir $sdir >> /dev/null 2>&1
+	# userdomains localdomains ssldomains domainips useripmap
+	ssh -p $sourceport root@$sourcehost $ssh_opts "cat /etc/localdomains" > $sdir/$sourcehost.localdomains
+	ssh -p $sourceport root@$sourcehost $ssh_opts "cat /etc/userdomains" > $sdir/$sourcehost.userdomains
+	ssh -p $sourceport root@$sourcehost $ssh_opts "cat /etc/ssldomains" > $sdir/$sourcehost.ssldomains
+	ssh -p $sourceport root@$sourcehost $ssh_opts "cat /etc/domainips" > $sdir/$sourcehost.domainips
+	if [ -f "$remote_users.ipmap" ]; then
+		cp -f $remote_users.ipmap $sdir/$sourcehost.useripmap
+	fi
+}
+
+sync_perlmods() {
+	localpmods="${tmp}.localperlmods"
+	remotepmods="${tmp}.remoteperlmods"
+	diffpmods="${tmp}.diffperlmods"
+
+	eout "[perlsync] checking for perl module differences between $sourcehost and local"
+	perldoc=`which perldoc 2> /dev/null`
+	ssh -p $sourceport root@$sourcehost $ssh_opts "perldoc -t perllocal | egrep Module | egrep '::' | egrep -v '^$' | awk '{print\$7}' | sort" > $remotepmods
+	if [ -f "$perldoc" ] && [ ! -z "$(cat $remotepmods)" ]; then
+		perldoc -t perllocal | egrep Module | egrep '::' | egrep -v '^$' | awk '{print$7}' | sort > $localpmods
+		cat $remotepmods | egrep -vwf $localpmods | sort | uniq > $diffpmods
+		diffpcnt=`wc -l $diffpmods | awk '{print$1}'`
+		if [ -z "$diffpmods" ] || [ "$diffpcnt" == "0" ]; then
+			eout "[perlsync] no perl module differences found" 1
+		else
+			eout "[perlsync] installing $diffpcnt missing perl modules" 1
+			log_state "migrate" "$$" "$sourcehost" "perlsync installing $diffpcnt missing perl modules"
+
+			for i in `cat $diffpmods`; do
+				if [ "$i" == "File::Path" ]; then
+					i="+$i"
+				fi
+				$timeout_prefix PERL_MM_USE_DEFAULT=1 perl -MCPAN -e "install $i" >> $log.full 2>&1
+				eout "[perlsync] installed perl module $i" 1
+				log_state "migrate" "$$" "$sourcehost" "perlsync installed perl module $i local"
+			done
+		fi
+	else
+		eout "[perlsync] could not find perldoc or remote returned empty module list" 1
+		log_state "migrate" "$$" "$sourcehost" "perlsync could not find perldoc or remote returned empty list"
+	fi
+
+}
+
+sync_pearmods() {
+	localmods="${tmp}.localpearmods"
+	remotemods="${tmp}.remotpearemods"
+	diffmods="${tmp}.diffpearmods"
+        rm -f $diffmods $localmods $remotemods >> /dev/null 2>&1
+
+	eout "[pearsync] checking for php pear module differences between $sourcehost and local"
+	pear=`which pear 2> /dev/null`
+	ssh -p $sourceport root@$sourcehost $ssh_opts "pear list | egrep stable | awk '{print\$1}'" > $remotemods
+	if [ -f "$pear" ] && [ ! -z "$(cat $remotemods)" ]; then
+		$pear list | egrep stable | awk '{print$1}' > $localmods
+		cat $remotemods | egrep -vwf $localmods | sort | uniq > $diffmods
+		diffcnt=`wc -l $diffmods | awk '{print$1}'`
+		if [ -z "$diffmods" ] || [ "$diffcnt" == "0" ]; then
+			eout "[pearsync] no php pear module differences found" 1
+		else
+			eout "[pearsync] installing $diffcnt missing php pear modules" 1
+			log_state "migrate" "$$" "$sourcehost" "pearsync installing $diffcnt missing php pear modules"
+
+			for i in `cat $diffmods`; do
+				$timeout_prefix pear install $i >> $log.full 2>&1
+				eout "[pearsync] installed php pear module $i" 1
+				log_state "migrate" "$$" "$sourcehost" "pearsync installed php pear module $i local"
+			done
+		fi
+	else
+		eout "[pearsync] could not find pear or remote returned empty module list" 1
+		log_state "migrate" "$$" "$sourcehost" "pearsync could not find pear or remote returned empty list"
+	fi
+
+}
+
+sync_gemmods() {
+	localmods="${tmp}.localgemmods"
+	remotemods="${tmp}.remotegemmods"
+	diffmods="${tmp}.diffgemmods"
+        rm -f $diffmods $localmods $remotemods >> /dev/null 2>&1
+
+	eout "[gemsync] checking for ruby gem module differences between $sourcehost and local"
+	gem=`which gem 2> /dev/null`
+	ssh -p $sourceport root@$sourcehost $ssh_opts "gem list | awk '{print\$1}'" > $remotemods
+	if [ -f "$pear" ] && [ ! -z "$(cat $remotemods)" ]; then
+		$gem list | awk '{print$1}' > $localmods
+		cat $remotemods | egrep -vwf $localmods | sort | uniq > $diffmods
+		diffcnt=`wc -l $diffmods | awk '{print$1}'`
+		if [ -z "$diffmods" ] || [ "$diffcnt" == "0" ]; then
+			eout "[gemsync] no ruby gem module differences found" 1
+		else
+			eout "[gemsync] installing $diffcnt missing ruby gem modules" 1
+			log_state "migrate" "$$" "$sourcehost" "gem installing $diffcnt missing ruby gem modules"
+
+			for i in `cat $diffmods`; do
+				$timeout_prefix $gem install $i --no-rdoc --no-ri >> $log.full 2>&1
+				eout "[gemsync] installed ruby gem module $i" 1
+				log_state "migrate" "$$" "$sourcehost" "gemsync installed ruby gem module $i local"
+			done
+		fi
+	else
+		eout "[gemsync] could not find ruby gem or remote returned empty module list" 1
+		log_state "migrate" "$$" "$sourcehost" "gemsync could not find ruby gem or remote returned empty list"
+	fi
+
+}
+
+sync_pythonmods() {
+	localmods="${tmp}.localpipmods"
+	remotemods="${tmp}.remotepipmods"
+	diffmods="${tmp}.diffpipmods"
+	rm -f $diffmods $localmods $remotemods >> /dev/null 2>&1
+
+	eout "[pythonsync] checking for python pip module differences between $sourcehost and local"
+	pip=`which pip 2> /dev/null`
+	ssh -p $sourceport root@$sourcehost $ssh_opts "pip --disable-pip-version-check list 2> /dev/null | egrep -vE 'PyYAML|pip|setuptools|MySQL-python' | awk '{print\$1}'" > $remotemods
+	if [ -f "$pip" ] && [ ! -z "$(cat $remotemods)" ]; then
+		$timeout_prefix $pip --disable-pip-version-check list 2> /dev/null | egrep -vE 'PyYAML|pip|setuptools|MySQL-python' | awk '{print$1}' > $localmods
+		cat $remotemods | egrep -vwf $localmods | sort | uniq > $diffmods
+		diffcnt=`wc -l $diffmods | awk '{print$1}'`
+		if [ -z "$diffmods" ] || [ "$diffcnt" == "0" ]; then
+			eout "[pythonsync] no python pip module differences found" 1
+		else
+			eout "[pythonrsync] installing $diffcnt missing python pip modules" 1
+			log_state "migrate" "$$" "$sourcehost" "pythonsync installing $diffcnt missing python pip modules"
+			for i in `cat $diffmods`; do
+				$timeout_prefix $pip --disable-pip-version-check install $i 2> /dev/null >> $log.full 2>&1
+				eout "[pythonsync] installed python pip module $i" 1
+				log_state "migrate" "$$" "$sourcehost" "pythonsync installed python pip module $i local"
+			done
+		fi
+	else
+		eout "[pythonsync] could not find python pip or remote returned empty module list" 1
+		log_state "migrate" "$$" "$sourcehost" "pythonsync could not find pip or remote returned empty list"
+	fi
+
+}
+
+conntest() {
+	host="$1"
+	port="$2"
+	wait_time="$3"
+	max_tries="$4"
+	if [ -z "$wait_time" ]; then
+		wait_time=60
+	fi
+	if [ -z "$max_tries" ]; then
+		max_tries=30
+	fi
+	tries=0
+	return=1
+	while [ ! "$return" == "0" ] && [ "$tries" -le "$max_tries" ]; do
+		((tries++))
+        	$nc -w2 -z $host $port >> /dev/null 2>&1
+		return="$?"
+		if [ ! "$return" == "0" ]; then
+			eout "[prerun] warning: could not connect to ssh at ${host}:${port}: sleeping for ${wait_time}s on attempt $tries of $max_tries."
+			sleep $wait_time
+		fi
+	done
+	if [ "$tries" == "$max_tries" ]; then
+		eout "[prerun] error: could not connect to ssh at $host:$port after an extended wait period, this is a fatal error, please check that the remote host is online and try again."
+		exit 1
+	fi
+}
+
+rsync_users() {
+	rcnt=`wc -l $remote_users | awk '{print$1}'`
+	lcnt=`wc -l $local_users | awk '{print$1}'`
+	if [ "$lcnt" -ne "0" ]; then
+		cat $remote_users | grep -wf $local_users > $local_users.rsyncusers
+		rucnt=`wc -l $local_users.rsyncusers | awk '{print$1}'`
+	else
+		eout "[rsync $user] error: no users from $sourcehost exist locally, nothing to rsync!" 1
+		rm -f ${tmp}.*
+		exit 1
+	fi
+	if [ "$rucnt" -ge "1" ]; then
+		runtime_rsynclist="/root/.cpmigrate.rsyncusers.${sourcehost}"
+		touch $runtime_rsynclist
+		if [ "$rsync_justmail" ]; then
+			eout "[rsync mail] starting cpmigrate users mail rsync of $rucnt users from $sourcehost" 1
+		else
+			eout "[rsync] starting cpmigrate users rsync of $rucnt users from $sourcehost" 1
+		fi
+		for user in `cat $local_users.rsyncusers`; do
+			isrunning=`cat $runtime_rsynclist | grep -w "$user"`
+			if [ ! "$isrunning" == "" ] && [ ! "$skip" == "1" ]; then
+				eout "[rsync $user] warning: found user $user in rsync runtime list, handled by another instance, skipping!" 1
+				skip=1
+			fi
+			if [ ! "$skip" == "1" ]; then
+				source_homedir=`egrep -w $user $remote_users.homedirs | awk '{print$2}'`
+				if [ -z "$source_homedir" ]; then
+					source_homedir="/home"
+				fi
+				echo "$user" >> $runtime_rsynclist
+				if [ -d "$local_homedir/$user" ]; then
+					conntest "$sourcehost" "$sourceport"
+					if [ "$rsync_justmail" ]; then
+						eout "[rsync mail $user] starting rsync of $source_homedir/$user/mail from $sourcehost" 1
+						log_state "migrate" "$$" "$sourcehost" "rsync mail $user"
+						log_state "user" "$sourcehost" "$user" "rsync mail running"
+						rsync -qa --delete -e "ssh -p $sourceport $ssh_opts" $rsync_excludes $sourcehost:$source_homedir/$user/mail/ $local_homedir/$user/mail/ >> $log.full 2>&1
+						/scripts/mailperm $user
+					else
+						eout "[rsync $user] starting rsync of $source_homedir/$user from $sourcehost" 1
+						log_state "migrate" "$$" "$sourcehost" "rsync $user"
+						log_state "user" "$sourcehost" "$user" "rsync running"
+						rsync -qa --delete -e "ssh -p $sourceport $ssh_opts" $rsync_excludes $sourcehost:$source_homedir/$user/ $local_homedir/$user/ >> $log.full 2>&1
+						rsync -qa -e "ssh -p $sourceport $ssh_opts" $sourcehost:/etc/proftpd/$user /etc/proftpd/ >> $log.full 2>&1
+						rsync -qa -e "ssh -p $sourceport $ssh_opts" $sourcehost:/etc/vftp/$user /etc/vftp/ >> $log.full 2>&1
+						/scripts/mailperm $user
+					fi
+					userip=`grep IP= /var/cpanel/users/$user | cut -d'=' -f2`
+					if [ -f "$local_homedir/$user/public_html/.htaccess" ]; then
+						sed -i 's/^AddHandler application/AddType application/g' $local_homedir/$user/public_html/.htaccess
+					fi
+					timeout 300s nice -n 19 find $local_homedir/$user/mail/*/*/{cur,new} -mtime +1095 -type f -print0 2>&1 /dev/null | xargs -0 -P4 -I{} rm -f "{}" >> $log.full 2>&1
+					timeout 120s nice -n 19 find /home/$user/public_html -maxdepth 4 -type f -name '.htaccess' -print0 | xargs -0 -I{} sed -i '/^RedirectMatch.*movingpage.cgi$/d' {}
+					/usr/local/cpanel/scripts/xfertool --unblockdynamiccontent $user >> /dev/null 2>&1
+					/usr/local/cpanel/bin/ftpupdate >> $log.full 2>&1
+					if [ "$rsync_justmail" ]; then
+						log_state "user" "$sourcehost" "$user" "rsync mail complete"
+						eout "[rsync $user] completed rsync mail of $source_homedir/$user/mail from $sourcehost" 1
+					else
+						log_state "user" "$sourcehost" "$user" "rsync complete"
+						eout "[rsync $user] completed rsync of $source_homedir/$user from $sourcehost" 1
+					fi
+				else
+					if [ "$rsync_justmail" ]; then
+						eout "[rsync mail $user] warning: user $user apparently exists locally but has no local homedir, requires manual intervention, ignoring user!" 1
+					else
+						eout "[rsync $user] warning: user $user apparently exists locally but has no local homedir, requires manual intervention, ignoring user!" 1
+					fi
+				fi
+			fi
+			skip=0
+			unset isrunning userip
+		        if [ -f "/root/stopcpmigrate" ]; then
+		                log_state "migrate" "$$" "$sourcehost" "rsync stopcpmigrate file exit"
+		                eout "[rsync] warning: detected /root/stopcpmigrate, exiting!" 1
+		                rm -f $tmp.*
+		                exit 1
+		        fi
+		        if [ -f "/root/stopcpmigrate.$$" ]; then
+		                log_state "migrate" "$$" "$sourcehost" "rsync stopcpmigrate file exit"
+		                eout "[rsync] warning: detected /root/stopcpmigrate.$$, exiting!" 1
+		                rm -f $tmp.*
+		                exit 1
+		        fi
+		done
+		/scripts/updateuserdatacache >> $log.full 2>&1
+		/scripts/updateuserdomains >> $log.full 2>&1
+	else
+		eout "[rsync] error: no users from $sourcehost exist locally, nothing to rsync!" 1
+		rm -f ${tmp}.*
+		exit 1
+	fi
+}
+
+
+mysql_sync() {
+	touch /tmp/.cpmigrate.lock
+	cat ${tmp}.mysqldbs.remote | awk '{print$2}' | egrep -v '^$' > ${tmp}.mysqldbs.remote.names ; cat ${tmp}.mysqldbs.local | awk '{print$2}' | egrep -v '^$' > ${tmp}.mysqldbs.local.names
+	cat ${tmp}.mysqldbs.remote.names | grep -vwf ${tmp}.mysqldbs.local.names > ${tmp}.mysqldbs.notlocal.names ; cat ${tmp}.mysqldbs.remote.names | grep -vwf ${tmp}.mysqldbs.notlocal.names > ${tmp}.mysqldbs.sizecheck.names
+	if [ "$mysql_sizematch" ]; then
+	 eout "[mysqlsync] comparing mysql database sizes between $sourcehost and local with size differences greater than ${mysql_sizematch_toleranceperc}% marked for sync" 1
+	 touch ${tmp}.mysqldbs.sizefail.names
+	 for db in `cat ${tmp}.mysqldbs.sizecheck.names`; do
+		remotesize=`cat ${tmp}.mysqldbs.remote | grep -w "$db" | awk '{print$1}'`
+		localsize=`cat ${tmp}.mysqldbs.local | grep -w "$db" | awk '{print$1}'`
+		tolperc_relmulti=`echo "0.$(echo "100 - ${mysql_sizematch_toleranceperc}" | bc)"`
+		minsize_for_sync=`echo "$remotesize * $tolperc_relmulti" | bc | cut -d'.' -f1`
+		if [ "$localsize" -lt "$minsize_for_sync" ]; then
+			echo "$db" >> ${tmp}.mysqldbs.sizefail.names
+		fi
+		unset remotesize localsize
+	 done
+	 unset db
+	fi
+	cnt_notlocaldbs=`wc -l ${tmp}.mysqldbs.notlocal.names | awk '{print$1}'`
+	cnt_sizefaildbs=`wc -l ${tmp}.mysqldbs.sizefail.names | awk '{print$1}'`
+	if [ "$mysql_sizematch" ]; then
+		cat ${tmp}.mysqldbs.notlocal.names ${tmp}.mysqldbs.sizefail.names > ${tmp}.mysqldbs.sync.names
+		sizematch_text="or which failed size match against local"
+	else
+		cat ${tmp}.mysqldbs.notlocal.names > ${tmp}.mysqldbs.sync.names
+	fi
+	cnt_syncdbs=`wc -l ${tmp}.mysqldbs.sync.names | awk '{print$1}'`
+	rm -f /tmp/.cpmigrate.lock
+	if [ "$mysqlsync_dbs" ]; then
+		if [ "$cnt_syncdbs" -ge "1" ]; then
+			eout "[mysqlsync] starting cpmigrate mysql import of $cnt_syncdbs databases from $sourcehost that do not exist local $sizematch_text" 1
+			for db in `cat ${tmp}.mysqldbs.sync.names`; do
+				isrunning=`cat $runtime_mysqllist | grep -w "$db"`
+				if [ ! "$isrunning" == "" ] && [ ! "$skip" == "1" ]; then
+					eout "[mysqlsync] warning: found $db in runtime list, handled by another instance, skipping!" 1
+					skip=1
+				else
+					echo $db >> $runtime_mysqllist
+				fi
+				
+				size=`cat ${tmp}.mysqldbs.remote | grep -w "$db" | awk '{print$1}'`
+				if [ -z "$size" ]; then
+					size=0
+				else
+					size=$[size/1024]
+				fi
+				if [ "$size" -gt "$mysqldb_max_msize" ]; then
+					eout "[mysqlsync] warning: database $db has size of ${size}kB which exceeds import size limit of ${mysqldb_max_msize}kB, skipping!" 1
+					skip=1
+				fi
+				
+				if [ ! "$skip" == "1" ]; then
+					log_state "migrate" "$$" "$sourcehost" "mysqldb sync $db"
+					log_state "user" "$sourcehost" "$db" "mysqldb sync running"
+					eout "[mysqlsync] starting mysqldump import of $sourcehost:mysql-$db" 1
+					mkdir $local_homedir/cpmigrate.mysqlsync 2> /dev/null
+					ssh -p $sourceport root@$sourcehost $ssh_opts "mkdir $local_homedir/cpmigrate.mysqlsync 2> /dev/null ; mysqldump --defaults-extra-file=/root/.my.cnf --add-drop-database --create-options $db > $local_homedir/cpmigrate.mysqlsync/${db}.sql" 2> $log.full
+					rsync -qa --remove-source-files -e "ssh -p $sourceport $ssh_opts" $sourcehost:$local_homedir/cpmigrate.mysqlsync/${db}.sql $local_homedir/cpmigrate.mysqlsync/ >> $log.full 2>&1
+					if [ -s "$local_homedir/cpmigrate.mysqlsync/$db.sql" ]; then
+						if [ -d "/var/lib/mysql/$db" ]; then
+							mysql --defaults-extra-file=/root/.my.cnf -e "drop database $db" 2> $log.full
+							#mysql --defaults-extra-file=/root/.my.cnf -e "flush tables" 2> $log.full
+						fi
+						mysql --defaults-extra-file=/root/.my.cnf -e "create database $db" 2> $log.full
+						mysql --defaults-extra-file=/root/.my.cnf $db < $local_homedir/cpmigrate.mysqlsync/${db}.sql 2> $log.full
+						rm -f $local_homedir/cpmigrate.mysqlsync/$db.sql
+						eout "[mysqlsync] completed import of $sourcehost:mysql-$db" 1
+					else
+						rm -f $local_homedir/cpmigrate.mysqlsync/$db.sql
+						eout "[mysqlsync] failed import of $sourcehost:mysql-$db (non-existent or zero sized dump)" 1
+					fi
+					log_state "user" "$sourcehost" "$db" "mysqldb sync completed"
+				fi
+				skip=0
+				unset isrunning size
+			        if [ -f "/root/stopcpmigrate" ]; then
+			                log_state "migrate" "$$" "$sourcehost" "mysqlsync stopcpmigrate file exit"
+			                eout "[mysqlsync] warning: detected /root/stopcpmigrate, exiting!" 1
+			                rm -f $tmp.*
+			                exit 1
+			        fi
+			        if [ -f "/root/stopcpmigrate.$$" ]; then
+			                log_state "migrate" "$$" "$sourcehost" "mysqlsync stopcpmigrate file exit"
+			                eout "[mysqlsync] warning: detected /root/stopcpmigrate.$$, exiting!" 1
+			                rm -f $tmp.*
+			                exit 1
+			        fi
+			done
+		else
+			eout "[mysqlsync] error: all databases on $sourcehost exist local or found no databases suitable to sync, nothing to do!" 1
+		fi
+	fi
+	if [ "$mysqlsync_users" ]; then
+		if [ -f "$remote_users" ]; then
+			eout "[mysqlsync] dumping mysql user and database grants from $sourcehost and comparing to local mysql grants" 1
+			ssh -p $sourceport root@$sourcehost $ssh_opts "mysqldump --defaults-extra-file=/root/.my.cnf mysql user --where=\"user LIKE '%' AND (host = 'localhost' AND user != 'root')\" --skip-opt --no-create-info | egrep 'INSERT INTO'" 2> $log.full > ${tmp}.remotemysql.user
+			ssh -p $sourceport root@$sourcehost $ssh_opts "mysqldump --defaults-extra-file=/root/.my.cnf mysql db --where=\"user LIKE '%' AND (host = 'localhost' AND user != 'root')\" --skip-opt --no-create-info | egrep 'INSERT INTO'" 2> $log.full > ${tmp}.remotemysql.db
+			ssh -p $sourceport root@$sourcehost $ssh_opts "mysql --defaults-extra-file=/root/.my.cnf mysql -e \"SELECT DISTINCT(user) FROM user\" | awk '{print\$1}' | egrep -vw 'user|root|horde|logaholic|modsec|exim'" >  ${tmp}.remotemysql.userlist
+			mysqldump --defaults-extra-file=/root/.my.cnf mysql user --where="user LIKE '%' AND (host = 'localhost' AND user != 'root')" --skip-opt --no-create-info | egrep 'INSERT INTO' 2> $log.full > ${tmp}.localmysql.user
+			mysqldump --defaults-extra-file=/root/.my.cnf mysql db --where="user LIKE '%' AND (host = 'localhost' AND user != 'root')" --skip-opt --no-create-info | egrep 'INSERT INTO' 2> $log.full > ${tmp}.localmysql.db
+			mysql --defaults-extra-file=/root/.my.cnf mysql -e "SELECT DISTINCT(user) FROM user" | awk '{print$1}' | egrep -vw 'user|root|horde|logaholic|modsec|exim' > ${tmp}.localmysql.userlist
+			
+			cnt_muser_diff=`cat ${tmp}.remotemysql.userlist | grep -vwf ${tmp}.localmysql.userlist | wc -l`
+			eout "[mysqlsync] found mysql user and database grants for import from $sourcehost" 1
+			for mysql_user in `cat ${tmp}.remotemysql.userlist | grep -vwf ${tmp}.localmysql.userlist`; do
+				user=`echo $mysql_user | cut -d '_' -f1`
+				if [ -f "/var/cpanel/users/$user" ]; then
+					# ${tmp}.remotemysql.user ${tmp}.remotemysql.db ${tmp}.localmysql.user ${tmp}.localmysql.db
+					# mysql.user
+					mysqluser_local=`egrep -w "$mysql_user" ${tmp}.localmysql.user`
+					mysqluser_remote=`egrep -w "$mysql_user" ${tmp}.remotemysql.user`
+					if [ -z "$mysqluser_local" ] && [ "$mysqluser_remote" ]; then
+						log_state "migrate" "$$" "$sourcehost" "mysqluser sync"
+						log_state "user" "$sourcehost" "$db" "mysqluser sync"
+						egrep -w "$mysql_user" ${tmp}.remotemysql.user | sed  "s/,NULL)/,'')/" > ${tmp}.mysqlinsert.1
+						cat ${tmp}.mysqlinsert.1 | sed "s/localhost/$HOSTNAME/" > ${tmp}.mysqlinsert.2
+						mysql --defaults-extra-file=/root/.my.cnf mysql < ${tmp}.mysqlinsert.1 2> /dev/null
+						mysql --defaults-extra-file=/root/.my.cnf mysql < ${tmp}.mysqlinsert.2 2> /dev/null
+						rm -f ${tmp}.mysqlinsert*
+						eout "[mysqlsync $mysql_user] imported missing mysql user $mysql_user from $sourcehost" 1
+						doup=1
+					fi
+					# mysql.db
+					mysqldb_local=`egrep -cw "$mysql_user" ${tmp}.localmysql.db`
+					mysqldb_remote=`egrep -cw "$mysql_user" ${tmp}.remotemysql.db`
+					if [ "$mysqldb_local" -ne "$mysqldb_remote" ]; then
+						log_state "migrate" "$$" "$sourcehost" "mysqldb sync"
+						log_state "user" "$sourcehost" "$mysql_user" "mysqldb sync"
+						egrep -w "$mysql_user" ${tmp}.remotemysql.db > ${tmp}.mysqlinsert
+						egrep -w "$mysql_user" ${tmp}.remotemysql.db | sed "s/localhost/$HOSTNAME/" >> ${tmp}.mysqlinsert
+						split -l1 ${tmp}.mysqlinsert .mysqlinsert
+						for i in `find .mysqlinsert* -maxdepth 1 -type f 2> /dev/null`; do
+							mysql --defaults-extra-file=/root/.my.cnf mysql < $i 2> /dev/null
+						done
+						rm -f ${tmp}.mysqlinsert .mysqlinsert*
+						eout "[mysqlsync $mysql_user] imported database access records for mysql user $mysql_user from $sourcehost" 1
+						doup=1
+					fi
+				fi
+				unset mysqluser_local mysqluser_remote
+			        if [ -f "/root/stopcpmigrate" ]; then
+			                log_state "migrate" "$$" "$sourcehost" "mysqlsync stopcpmigrate file exit"
+			                eout "[mysqlsync] warning: detected /root/stopcpmigrate, exiting!" 1
+			                rm -f $tmp.*
+			                exit 1
+			        fi
+			        if [ -f "/root/stopcpmigrate.$$" ]; then
+			                log_state "migrate" "$$" "$sourcehost" "mysqlsync stopcpmigrate file exit"
+			                eout "[mysqlsync] warning: detected /root/stopcpmigrate.$$, exiting!" 1
+			                rm -f $tmp.*
+			                exit 1
+			        fi
+			done
+			mysql --defaults-extra-file=/root/.my.cnf -e "flush privileges" >> /dev/null 2>&1
+			if [ "$doup" ]; then
+				mysqlcheck --defaults-extra-file=/root/.my.cnf mysql --check-upgrade --auto-repair >> /dev/null 2>&1
+			fi
+		fi
+	fi
+	rm -f ${tmp}.*
+	exit 0
+}
+
+diff() {
+	if [ "$1" == "list" ]; then
+		cat $migrate_users | more
+	elif [ "$1" == "listdupes" ]; then
+                cat $local_users | egrep -wf $remote_users > $logdir/$sourcehost/${sourcehost}.duplicates
+                cnt=`wc -l $logdir/$sourcehost/${sourcehost}.duplicates | awk '{print$1}'`
+                if [ "$cnt" -ge "1" 2> /dev/null ]; then
+                        cat $logdir/$sourcehost/${sourcehost}.duplicates
+                else
+                        echo "no duplicates found"
+                fi
+	else
+		if [ -f "$runtime_userlist" ]; then
+			local_rucount=`wc -l $runtime_userlist | awk '{print$1}'`
+		else
+			local_rucount=0
+		fi
+
+		# session migrated users count / pending migration users count
+		session_users_count="$local_rucount"
+		session_users_pcount=$[total_source_users-local_rucount]
+		session_pcomp=`echo "scale=2; ($session_users_count / $total_source_users) * 100" | bc`
+		session_prem=`echo "scale=2; 100 - $session_pcomp" | bc`
+
+		# remote migrated users count / pending migration users count
+		server_users_nlocal_count=$[total_source_users-migrate_users_count]
+		server_users_nlocal_pcount="$migrate_users_count"
+		server_pcomp=`echo "scale=2; ($server_users_nlocal_count / $total_source_users) * 100" | bc`
+		server_prem=`echo "scale=2; 100 - $server_pcomp" | bc`
+
+		# dupes
+                cat $local_users | egrep -wf $remote_users > $logdir/$sourcehost/${sourcehost}.duplicates
+		server_dupes_count=`wc -l $logdir/$sourcehost/${sourcehost}.duplicates | awk '{print$1}'`
+		server_dupes_pcomp=`echo "scale=2; ($server_dupes_count / $total_source_users) * 100" | bc`
+		server_dupes_prem=`echo "scale=2; 100 - $server_dupes_pcomp" | bc`
+
+		echo "cpmigrate stats for $sourcehost to $HOSTNAME (use '-d list' to view pending users list):"
+		echo "   total remote users:           $total_source_users"
+		echo "   completed session migrations: $session_users_count (${session_pcomp}%)"
+		echo "   remaining session migrations: $session_users_pcount (${session_prem}%)"
+		echo "   remaining non-local users:    $server_users_nlocal_pcount (${server_prem}%)"
+		echo "   unmigratable duplicate users: $server_dupes_count (${server_dupes_pcomp}%)"
+	fi
+	rm -f ${tmp}.*
+	exit 0
+}
+
+cpmigrate_die() {
+	sig="$1"
+	touch /root/stopcpmigrate.$$
+	eout "[postrun] warning: detected $sig sent to pid $$, exiting!" 1
+	rm -f $tmp.*
+	exit 1
+}
+
+
+migrate() {
+	
+	log_state "migrate" "$$" "$sourcehost" "migrate setup"
+	trap 'cpmigrate_die "SIGQUIT"' SIGQUIT
+	if [ -f "/root/stopcpmigrate" ]; then
+		log_state "migrate" "$$" "$sourcehost" "migrate stopcpmigrate file exit"
+		eout "[migrate] warning: detected /root/stopcpmigrate, exiting!" 1
+		rm -f $tmp.*
+		exit 1
+	fi
+	if [ -f "/root/stopcpmigrate.$$" ]; then
+		log_state "migrate" "$$" "$sourcehost" "migrate stopcpmigrate file exit"
+		eout "[migrate] warning: detected /root/stopcpmigrate.$$, exiting!" 1
+		rm -f $tmp.*
+		exit 1
+	fi
+	
+	if [ -z "$(cat $migrate_users)" ] || [ "$migrate_users_count" == "0" ]; then
+		log_state "migrate" "$$" "$sourcehost" "migrate empty user list exit"
+		eout "[migrate] error: migrate user list returned empty, aborting!" 1
+		exit 1
+	fi
+	
+        if [ "$(df -m /home | egrep dev  | awk '{print$5}' | tr -d '%')" -ge "$crit_diskuse" 2> /dev/null ] || [ "$(df -m /var | egrep dev  | awk '{print$5}' | tr -d '%')" -ge "$crit_diskuse" 2> /dev/null ]; then
+                if [ -z "$skip_cduse" ]; then
+			log_state "migrate" "$$" "$sourcehost" "migrate local disk usage critical"
+                        eout "[migrate] error: disk usage on /home or /var is critical above ${crit_diskuse}%  - process is bailing out" 1
+			exit 1
+                fi
+        fi
+	
+	eout "[migrate $sourcehost] starting cpmigrate of $migrate_users_count/$total_source_users users from $sourcehost" 1
+	eout "[migrate $sourcehost] using pkgacct options '$pkgopts' and restorepkg options '$restoreopts'" 1
+	
+	if [ -f "/tmp/.cpmigrate.lock" ]; then
+		eout "[migrate] error: cpmigrate usage currently locked, try again in a few minutes - aborting!" 1
+		log_state "migrate" "$$" "$sourcehost" "migrate empty user list exit"
+		rm -f ${tmp}.*
+		exit 1
+	else
+		touch /tmp/.cpmigrate.lock
+		eout "[migrate $sourcehost] cpmigrate usage locked for premigrate actions" 1
+		log_state "migrate" "$$" "$sourcehost" "validating cpanel.config settings"
+		valparkonothers=`egrep "^allowparkonothers=0" /var/cpanel/cpanel.config`
+		if [ "$valparkonothers" ]; then
+			sed -i 's/^allowparkonothers=.*/allowparkonothers=1/' /var/cpanel/cpanel.config
+			trap 'touch /root/.cpmigrate.tweaksettings' HUP
+			eout "[migrate $sourcehost] warning: found cpanel.config allowparkonothers=0, this is known to cause addon/park domain restores to fail, set allowparkonothers=1 value." 1
+			do_tweak=1
+			unset valparkonothers
+		fi
+
+		valdnsadmin=`egrep "dnsadminapp=/usr/local/admin/scripts/customdns/dnsadmin" /var/cpanel/cpanel.config`
+		if [ "$valdnsadmin" ]; then
+                        sed -i 's/^dnsadminapp=.*/dnsadminapp/' /var/cpanel/cpanel.config
+                        trap 'touch /root/.cpmigrate.tweaksettings' HUP
+                        eout "[migrate $sourcehost] warning: found cpanel.config custom dnsadminapp, this is known to cause addon/park domain restores to fail, unset dnsadminapp value." 1
+			do_tweak=1
+                        unset valparkonothers
+		fi
+
+		if [ "$do_tweak" ]; then
+			eout "[migrate $sourcehost] changes made to cpanel.config, running tweaksettings save." 1
+                        /usr/local/cpanel/whostmgr/bin/whostmgr2 --updatetweaksettings
+		fi
+
+		# copy common /etc cpanel domain files for post-migration q/a
+		copy_cpinfo
+
+		# sync perl/php/ruby gem modules between source and local
+		if [ ! -f "/root/.cpmigrate.syncmods" ]; then
+			sync_perlmods
+			sync_pearmods
+			sync_gemmods
+			sync_pythonmods
+			touch /root/.cpmigrate.syncmods
+		fi
+
+		rm -f /tmp/.cpmigrate.lock
+
+		eout "[migrate] locked cpmigrate usage to build local cache and copy cpanel packages from $sourcehost" 1
+		touch /tmp/.cpmigrate.lock
+		splitval=`echo $pkgopts | grep -w "\--split"`
+		dip_users="${tmp}.dip"
+		ssh -p $sourceport root@$sourcehost "cat /etc/domainips | grep -v '\#' | awk '{print\$2}'" 2> $log.full > $dip_users.domips
+		ssh -p $sourceport root@$sourcehost "cat /etc/domainusers | tr -d ':'" 2> $log.full > $dip_users.domusers
+		cat $dip_users.domusers | tr -d ':' | grep -wf $dip_users.domips  | awk '{print$1}' > $dip_users
+		rsync -qa -e "ssh -p $sourceport $ssh_opts" $sourcehost:/var/cpanel/packages /var/cpanel >> $log.full 2>&1
+		if [ ! "$skipacl" ]; then
+			rsync -qa -e "ssh -p $sourceport $ssh_opts" $sourcehost:/var/cpanel/acllists /var/cpanel >> $log.full 2>&1
+		fi
+		eout "[migrate] premigrate and cache/package transfer tasks completed - unlocked cpmigrate usage" 1
+		rm -f /tmp/.cpmigrate.lock
+	fi
+	/scripts/rebuildippool >> /dev/null 2>&1
+	for user in `cat $migrate_users`; do
+		## at some point unify disk check, conntest, stopcpmigrate and other conditional checks into a single function
+		## meh
+		conntest "$sourcehost" "$sourceport"
+	        if [ "$(df -m /home | egrep dev  | awk '{print$5}' | tr -d '%')" -ge "$crit_diskuse" 2> /dev/null ] || [ "$(df -m /var | egrep dev  | awk '{print$5}' | tr -d '%')" -ge "$crit_diskuse" 2> /dev/null ]; then
+	                if [ -z "$skip_cduse" ]; then
+				log_state "migrate" "$$" "$sourcehost" "migrate local disk usage critical"
+	                        eout "[migrate] error: disk usage on /home or /var is critical above ${crit_diskuse}%  - process is bailing out" 1
+				exit 1
+        	        fi
+	        fi
+		if [ ! -f "/var/cpanel/users/$user" ] || [ "$trustme" ]; then
+			source_homedir=`egrep -w $user $remote_users.homedirs | awk '{print$2}'`
+			if [ -z "$source_homedir" ]; then
+				source_homedir="/home"
+			fi
+			if [ "$exclude_largeusr" == "1" ] && [ -f "$exclude_largeusr_list" ]; then
+				user_size=`cat $exclude_largeusr_list | grep -w $user | awk '{print$1}'`
+				if [ -z "$user_size" ]; then
+					user_size=0
+				fi
+				if [ "$user_size" -gt "$exclude_largeusr_msize" ]; then
+					eout "[migrate $sourcehost $user] warning: exclude_largeusr enabled and $user size is $user_size, skipping!" 1
+					skip=1
+				fi
+			fi
+			isrunning=`cat $runtime_userlist | grep -w $user`
+			if [ ! "$isrunning" == "" ] && [ ! "$skip" == "1" ]; then
+				eout "[migrate $sourcehost $user] warning: found $user in runtime list, handled by another instance, skipping!" 1
+				skip=1
+			fi
+
+			ipmap_lock=/root/.cpmigrate.ipmap.lock
+			if [ "$ipmap" ] && [ ! "$skip" == "1" ]; then
+				skipdip=1
+				dipopts=""
+				user_ip=`grep -w $user $ipmap_file_sorted | cut -d':' -f2`
+				current_sharedip=`egrep '^ADDR' /etc/wwwacct.conf | awk '{print$2}'`
+				if [ ! "$user_ip" ]; then
+					eout "[migrate $sourcehost $user] warning: could not find user $user ip mapping in $ipmap_file; restoring to shared IP $current_sharedip" 1
+				else
+					touch ${ipmap_lock}.ip.${user_ip}
+				fi
+			fi
+			
+			if [ ! "$skip" == "1" ]; then
+				echo "$user" >> $runtime_userlist
+				eout "[migrate $sourcehost $user] packaging user $user on $sourcehost" 1
+				log_state "migrate" "$$" "$sourcehost" "migrate $user pkgacct"
+				log_state "user" "$sourcehost" "$user" "pkgacct"
+				if [ "$local" ] && [ -f "$pkgstore/cpmove-$user.tar.gz" ]; then
+					local_cpmsize=`stat -c'%s' $pkgstore/cpmove-$user.tar.gz`
+				fi
+				if [ "$local" ] && [ -f "$pkgstore/cpmove-$user.tar.gz" ] && [ "$local_cpmsize" -ne "0" ]; then
+					eout "[migrate $sourcehost $user] use local is set and found $pkgstore/cpmove-$user.tar.gz, skipping remote pkgacct!" 1
+				else
+					ssh -p $sourceport root@$sourcehost "/usr/local/cpanel/bin/cpuwatch $pkgload /scripts/pkgacct $pkgopts $user $pkgpath" >> $log.full 2>&1
+					log_state "migrate" "$$" "$sourcehost" "migrate $user transfer pkgacct"
+					log_state "user" "$sourcehost" "$user" "transfer pkgacct"
+					if [ "$splitval" ]; then
+						log_state "migrate" "$$" "$sourcehost" "migrate $user pkgacct"
+						log_state "user" "$sourcehost" "$user" "pkgacct $user"
+						eout "[migrate $sourcehost $user] copying cpmove-$user split parts from $sourcehost to local" 1
+						scp -rq -o 'Compression=no' -o 'StrictHostKeyChecking=no' -P $sourceport root@$sourcehost:$pkgpath/cpmove-$user-split $pkgstore/ >> $log.full 2>&1
+						ssh -p $sourceport root@$sourcehost "rm -vrf $pkgpath/cpmove-$user-split" >> $log.full 2>&1
+						eout "[migrate $sourcehost $user] merging cpmove-$user split parts into cpmove-$user.tar.gz" 1
+						log_state "migrate" "$$" "$sourcehost" "migrate $user merge split-parts pkgacct"
+						log_state "user" "$sourcehost" "$user" "merge split-parts pkgacct"
+						cat $local_homedir/cpmove-$user-split/cpmove-$user.tar.gz.part* > $pkgstore/cpmove-$user.tar.gz
+						rm -rf $local_homedir/cpmove-$user-split/
+					else
+						eout "[migrate $sourcehost $user] copying cpmove-$user.tar.gz from $sourcehost to local" 1
+						scp -q -o 'Compression=no' -o 'StrictHostKeyChecking=no' -P $sourceport root@$sourcehost:$pkgpath/cpmove-$user.tar.gz $pkgstore/ >> $log.full 2>&1
+						ssh -p $sourceport root@$sourcehost "rm -vf $pkgpath/cpmove-$user.tar.gz" >> $log.full 2>&1
+					fi
+				fi
+				if [ -f "$pkgstore/cpmove-$user.tar.gz" ]; then
+					if [ ! "$skipdip" ]; then
+						freeips=`cat /etc/ipaddrpool | grep -vE "^10\.[0-9]+\." -c`
+						dipcheck=`cat $dip_users | grep -w $user`
+						if [ ! "$dipcheck" == "" ] && [ "$freeips" -gt "0" ]; then
+							dipopts="--ip=y"
+							eout "[migrate $sourcehost $user] marked user $user for restore to dedicated IP address based on source server" 1
+							elif [ ! "$dipcheck" == "" ] && [ "$freeips" -le "0" ]; then
+							eout "[migrate $sourcehost $user] warning: marked user $user for restore to dedicated IP address but no available IP addresses were found, restoring to shared IP address!" 1
+							dipopts=""
+						else
+							dipopts=""
+						fi
+					else
+						dipopts=""
+					fi
+					
+					if [ "$ipmap" ] && [ -f "$ipmap_lock" ]; then
+						ipmap_lock_ipcheck=`find ${ipmap_lock}.ip.* -type f | grep -vw "$user_ip"`
+						if [ -z "$ipmap_lock_ipcheck" ]; then
+							eout "[migrate $sourcehost $user] restorepkg usage locked by pid $(cat $ipmap_lock) but all locks are for the same IP address, safely ignoring lock." 1
+							rm -f $ipmap_lock
+						fi
+						sleep_max=50
+						sleep_time=60
+						timeout=$[sleep_max*sleep_time]
+						while [ -f "$ipmap_lock" ]; do
+							((sleep_count++))
+							eout "[migrate $sourcehost $user] warning: restorepkg usage locked by pid $(cat $ipmap_lock), waiting ${sleep_time} seconds for lock to restore user $user, attempt ${sleep_count} of ${sleep_max}..." 1
+							log_state "migrate" "$$" "$sourcehost" "migrate $user waiting for exclusive ipmap lock"
+							log_state "user" "$sourcehost" "$user" "waiting for ipmap lock"
+							sleep $sleep_time
+							if [ "$sleep_count" -ge "$sleep_max" ]; then
+								sed -i "/^$user/d" $runtime_userlist
+								eout "[migrate $sourcehost $user] error: reached $timeout second timeout while waiting for restorepkg ip mapped lock, no further restore attempts will be made on this instance, exiting!" 1
+								log_state "migrate" "$$" "$sourcehost" "migrate $user timeout waiting for exclusive ipmap lock"
+								log_state "user" "$sourcehost" "$user" "failure: timeout waiting for ipmap lock"
+								rm -f $tmp* ${ipmap_lock}.ip.${user_ip}
+								exit 1
+							fi
+						done
+						unset ipmap_lock_ipcheck sleep_count
+					fi
+					
+					if [ "$ipmap" ] && [ "$user_ip" ]; then
+						touch $ipmap_lock
+						echo "$$" > $ipmap_lock
+						eout "[migrate $sourcehost $user] got exclusive lock for ip mapped restorepkg of user $user" 1
+						sed -i "s/^ADDR.*/ADDR $user_ip/" /etc/wwwacct.conf
+						/scripts/rebuildippool >> /dev/null 2>&1
+						eout "[migrate $sourcehost $user] marked user $user for restore to mapped IP address $user_ip" 1
+					fi
+					eout "[migrate $sourcehost $user] restoring $user from $pkgstore/cpmove-$user.tar.gz" 1
+					log_state "migrate" "$$" "$sourcehost" "migrate $user restore pkgacct"
+					log_state "user" "$sourcehost" "$user" "restore pkgacct"
+					/scripts/restorepkg $restoreopts $dipopts $pkgstore/cpmove-$user.tar.gz >> $log.full 2>&1
+					if [ "$ipmap" ] && [ "$user_ip" ]; then
+						sed -i "s/^ADDR.*/ADDR $user_ip/" /etc/wwwacct.conf
+						/scripts/rebuildippool >> /dev/null 2>&1
+						log_state "migrate" "$$" "$sourcehost" "migrate $user setsiteip $user_ip"
+						log_state "user" "$sourcehost" "$user" "restore setsiteip $user_ip"
+						/usr/local/cpanel/bin/setsiteip -u $user $user_ip >> $log.full 2>&1
+						if [ "$current_sharedip" ]; then
+							sed -i "s/^ADDR.*/ADDR $current_sharedip/" /etc/wwwacct.conf
+							/scripts/rebuildippool >> /dev/null 2>&1
+						fi
+						rm -f $ipmap_lock
+						rm -f ${ipmap_lock}.ip.${user_ip}
+						unset current_sharedip user_ip
+					fi
+					
+					if [ -d "$local_homedir/$user" ] && [ -f "/var/cpanel/users/$user" ]; then
+						if [ "$rsync_homedir" == "1" ]; then
+							eout "[migrate $sourcehost $user] starting rsync of $sourcehost:$source_homedir/$user to $local_homedir/$user" 1
+							log_state "migrate" "$$" "$sourcehost" "migrate $user rsync homedir started"
+							log_state "user" "$sourcehost" "$user" "rsync homedir started"
+							rsync -qa -e "ssh -p $sourceport $ssh_opts" $rsync_excludes $sourcehost:$source_homedir/$user/ $local_homedir/$user/ >> $log.full 2>&1
+							rsync -qa -e "ssh -p $sourceport $ssh_opts" $sourcehost:/etc/proftpd/$user /etc/proftpd/ >> $log.full 2>&1
+							rsync -qa -e "ssh -p $sourceport $ssh_opts" $sourcehost:/etc/vftp/$user /etc/vftp/ >> $log.full 2>&1
+							timeout 300s nice -n 19 find $local_homedir/$user/mail/*/*/{cur,new} -mtime +1095 -type f -print0 2>&1 /dev/null | xargs -0 -P4 -I{} rm -f "{}" >> $log.full 2>&1
+							eout "[migrate $sourcehost $user] completed rsync of $sourcehost:$source_homedir/$user to $local_homedir/$user" 1
+							log_state "migrate" "$$" "$sourcehost" "migrate $user rsync homedir complete"
+							log_state "user" "$sourcehost" "$user" "rsync homedir complete"
+						fi
+						/usr/local/cpanel/bin/maildir-migrate --convert --overwrite --to-${mailserver} $user
+						eout "[migrate $sourcehost $user] converted $user mailboxes to local mailserver $mailserver" 1
+						log_state "migrate" "$$" "$sourcehost" "migrate $user convert mailbox"
+						log_state "user" "$sourcehost" "$user" "convert mailbox"
+						
+						if [ "$express" ]; then
+							user_oldip=`cat $remote_users.ipmap | grep -w $user | cut -d ':' -f2 | head -n1`
+							user_newip=`grep IP= /var/cpanel/users/$user | cut -d '=' -f2 | head -n1`
+							if [ "$user_oldip" ] && [ "$user_newip" ]; then
+								ssh -p $sourceport root@$sourcehost "/usr/local/cpanel/scripts/xfertool --swapip $user $user_oldip $user_newip" >> $log.full 2>&1
+								eout "[migrate $sourcehost $user] remote DNS updated from $user_oldip to $user_newip using xfertool" 1
+								log_state "migrate" "$$" "$sourcehost" "migrate $user xfertool updated remote DNS"
+								log_state "user" "$sourcehost" "$user" "xfertool updated remote DNS"
+							else
+								eout "[migrate $sourcehost $user] failed to update remote DNS for $user on $sourcehost (debug: user: $user, user_oldip: $user_oldip, user_newip: $user_newip)"
+							fi
+							
+							ssh -p $sourceport root@$sourcehost "/usr/local/cpanel/scripts/xfertool --blockdynamiccontent $user" >> $log.full 2>&1
+							eout "[migrate $sourcehost $user] blocked dynamic content page loads on $sourcehost for $user using xfertool" 1
+							log_state "migrate" "$$" "$sourcehost" "migrate $user blocked dynamic content on $sourcehost using xfertool"
+							log_state "user" "$sourcehost" "$user" "xfertool $sourcehost dynamic content block"
+						fi
+						
+						if [ "$kill" ]; then
+							ssh -p $sourceport root@$sourcehost "yes | /scripts/removeacct $user --force" >> $log.full 2>&1
+							eout "[migrate $sourcehost $user] terminated $user from $sourcehost with '/scripts/removeacct $user --force'" 1
+							log_state "migrate" "$$" "$sourcehost" "migrate $user terminated on $sourcehost"
+							log_state "user" "$sourcehost" "$user" "removeacct on $sourcehost"
+						fi
+						
+		                                eout "[migrate $sourcehost $user] fixing permissions under $local_homedir/$user" 1
+						log_state "migrate" "$$" "$sourcehost" "migrate $user fix permissions"
+						log_state "user" "$sourcehost" "$user" "fix permissions"
+						chown ${user}.${user} $local_homedir/$user
+						timeout 240s nice -n 19 find $local_homedir/$user/public_html -not -user nobody -not -user $user -print0 | xargs -0 chown $user 2> /dev/null
+						timeout 240s nice -n 19 find $local_homedir/$user/public_html -not -group nobody -not -group $user -print0 | xargs -0 chgrp $user 2> /dev/null
+						timeout 240s chown -R ${user}.${user} $local_homedir/$user/mail
+						chown -R ${user}.nobody /home/${user}/.htpasswds
+						chown ${user}.nobody $local_homedir/$user/public_html
+						for i in `egrep -w 'documentroot' /var/cpanel/userdata/${user}/* | egrep -v '\.cache:' | cut -d':' -f3 | awk '{print$1}' | sort | uniq`; do
+							if [ -d "$i" ]; then
+								chown ${user}.nobody $i
+							fi
+						done
+						chown ${user}.mail /home/${user}/etc
+						/scripts/mailperm $user
+
+						rm -vf $local_homedir/$user/public_html/php.ini $local_homedir/$user/php.ini >> $log.full 2>&1
+						if [ -f "$local_homedir/$user/public_html/.htaccess" ]; then
+							sed -i '/^RedirectMatch.*movingpage.cgi$/d' $local_homedir/$user/public_html/.htaccess
+						fi
+
+                                                if [ -x "$newshell" ]; then
+                                                        chsh -s $newshell $user
+                                                        eout "[migrate $sourcehost $user] changed shell to $newshell for $user" 1
+							log_state "migrate" "$$" "$sourcehost" "migrate $user set shell to $newshell"
+							log_state "user" "$sourcehost" "$user" "set shell to $newshell"
+                                                fi
+						
+						# cpanel is no longer populating out /var/cpanel/resellers for some reason
+						# this is a dirty fix
+						grep OWNER= /var/cpanel/users/* | grep -v OWNER=root |cut -d':' -f2 | sed 's/OWNER=//' | sort | uniq | awk '{print$1":add-pkg,allow-addoncreate,allow-parkedcreate,allow-unlimited-bw-pkgs,allow-unlimited-disk-pkgs,allow-unlimited-pkgs,create-acct,create-dns,disallow-shell,edit-account,edit-dns,edit-mx,edit-pkg,kill-acct,kill-dns,limit-bandwidth,list-accts,news,park-dns,passwd,quota,show-bandwidth,stats,status,suspend-acct,upgrade-account,viewglobalpackages"}' > /var/cpanel/resellers
+						
+						if [ "$dorebuildconf" ]; then
+                                                        eout "[migrate $sourcehost $user] rebuilding httpdconf" 1
+							log_state "migrate" "$$" "$sourcehost" "migrate $user rebuildhttpdconf"
+							log_state "user" "$sourcehost" "$user" "rebuildhttpdconf"
+							if [ -f "/usr/local/sbin/cpusercheck" ]; then
+								/usr/local/sbin/cpusercheck >> /dev/null 2>&1
+							else
+								wget -q -t4 -T4 http://129.121.132.46/downloads/cpusercheck -O /usr/local/sbin/cpusercheck ; chmod 750 /usr/local/sbin/cpusercheck
+								/usr/local/sbin/cpusercheck >> /dev/null 2>&1
+							fi
+						fi
+						eout "[migrate $sourcehost $user] completed restore for $user from $sourcehost" 1
+						log_state "migrate" "$$" "$sourcehost" "migrate $user restore completed"
+						log_state "user" "$sourcehost" "$user" "restore completed"
+					else
+						sed -i "/^${user}$/d" $runtime_userlist
+						eout "[migrate $sourcehost $user] restore failed for $user from $sourcehost" 1
+						log_state "migrate" "$$" "$sourcehost" "migrate $user restore failed"
+						log_state "user" "$sourcehost" "$user" "restore failed"
+					fi
+				else
+					sed -i "/^${user}$/d" $runtime_userlist
+					eout "[migrate $sourcehost $user] restore failed for $user from $sourcehost ($pkgstore/cpmove-$user.tar.gz file not found)" 1
+					log_state "migrate" "$$" "$sourcehost" "migrate $user restore failed ($pkgstore/cpmove-$user.tar.gz not found)"
+					log_state "user" "$sourcehost" "$user" "restore failed ($pkgstore/cpmove-$user.tar.gz not found)"
+					if [ "$ipmap" ]; then
+						rm -f ${ipmap_lock}.ip.${user_ip}
+					fi
+				fi
+			fi
+		else
+                        isrunning=`cat $runtime_userlist | grep -w $user`
+                        if [ ! "$isrunning" == "" ] && [ ! "$skip" == "1" ]; then
+                                eout "[migrate $sourcehost $user] warning: found $user in runtime list, handled by another instance, skipping!" 1
+                                skip=1
+                        else
+				eout "[migrate $sourcehost $user] error: skipping user $user, duplicate or already exists!" 1
+				if [ "$ipmap" ]; then
+					rm -f ${ipmap_lock}.ip.${user_ip}
+				fi
+			fi
+		fi
+		skip=0
+		unset user_oldip
+		unset user_newip
+		unset dipcheck
+		unset dipopts
+		unset isrunning
+		if [ -f "/root/stopcpmigrate" ]; then
+			log_state "migrate" "$$" "$sourcehost" "migrate stopcpmigrate file exit"
+			eout "[migrate] warning: detected /root/stopcpmigrate, exiting!" 1
+			rm -f $tmp.*
+			if [ "$ipmap" ]; then
+				rm -f ${ipmap_lock}.ip.${user_ip}
+			fi
+			exit 1
+		fi
+		if [ -f "/root/stopcpmigrate.$$" ]; then
+			log_state "migrate" "$$" "$sourcehost" "migrate stopcpmigrate file exit"
+			eout "[migrate] warning: detected /root/stopcpmigrate.$$, exiting!" 1
+			rm -f $tmp.*
+			if [ "$ipmap" ]; then
+				rm -f ${ipmap_lock}.ip.${user_ip}
+			fi
+			exit 1
+		fi
+	done
+	rm -f $tmp.*
+	if [ "$ipmap" ]; then
+		rm -f ${ipmap_lock}.ip.${user_ip}
+	fi
+	log_state "migrate" "$$" "$sourcehost" "migrate nothing left to do - clean exit"
+	eout "[migrate] nothing left to do here, exiting clean, kthxbye." 1
+}
+
+
+usage() {
+cat<<EOF
+usage: $0 
+[-h|--host IP/HOST] [-p|--port SSHPORT] [-b|--background] [-o|--force]
+[-f|--file USERFILE] [-r|--rsync] [-ip|--ipmap IPMAP] [-e|--express]
+[-s|--split] [-l|--local] [-sh|--new-shell] [-ru|--rsync-users]
+[-mi|--mysql-import OPTION] [-sm|--sync-mods] [-sni|--skip-dip]
+[-xf|--exclude-file] [-xl|--exclude-large] [-xm|--exclude-mysql]
+[-d|--diff list] [-cl|--clean] [--help]
+EOF
+}
+
+help() {
+cat<<EOF
+usage $0 [ OPTION ]
+  NOTE: The cpmigrate script requires a valid passwordless ssh key relationship
+  from the local server to the source server.
+
+ -h, --host IP|HOST [required]
+   Remote server IP or FQDN host name
+
+ -p, --port SSHPORT [optional] default: 22
+   Remote server ssh port
+
+ -f, --file USERFILE [optional]
+   Location of file containing usernames that should be migrated. If no file
+   is supplied, all users on remote server are evaluated for migration,
+   excluding users locally with the same username. File format is line spaced.
+
+ -r, --rsync [optional] default: off
+   Tells pkgacct to skiphomedir during packaging then rsync is called after
+   account restore to sync the user home directory from remote server.
+
+ -o, --force [optional] default: off
+   Tells restorepkg to use --force option in which many sanity checks are
+   skipped. This is not recommended and should only be used in cases where no
+   alternative is available to force a migration through to completion. This may
+   also be useful when pkgacct is reporting mysql dump errors or restrepkg is
+   reporting mysql users already exist (such as when mysql was manually synced).
+
+ -s, --split [optional] default: off
+   Tells pkgacct that tar.gz archives should be created in split parts of equal
+   sizes. This improves packaging speed and reduces memory overhead. On local
+   side this will cause reassembly of the files to take place before restore
+   into a single tar.gz and the member parts will be deleted.
+
+ -e, --express [optional] default: off
+   Use cPanel xfertool to perform an express migration, in which an accounts DNS
+   is updated on the remote server to the new IP address and dynamic content is
+   blocked from further executing to prevent split-brain database copies.
+
+ -k, --kill [optional] default: off
+   Terminate account and dns on source server once restore has completed on
+   local host. This should be used with extreme caution as all data for the
+   account will be deleted on source server!
+
+ -l, --local [optional] default: off
+   Attempt to locate existing cpmove file for users from the local path at
+   /home/cpmove-user.tar.gz. If local cpmove file is found, remote packaging
+   and transfer will be skipped and the local file restored.
+
+ -d, --diff list [optional]
+   Compare local and remote user list and display number of users that exist on
+   remote but not on the local system. Use of '-d list' or '--diff list' will
+   display the entirety of the list which can be piped to a file.
+
+ -c, --rebuildconf
+   Perform an apache httpd.conf rebuild after each account restore. This is not
+   recommended and should only be used in specific use cases, such as server
+   merges.
+
+ -b, --background [optional]
+   Pushes the migration task into the background and all output is suppressed,
+   migration status can be tracked through the default /root/cpmigrate.log file.
+
+ -ru, --rsync-users [optional] default: off
+   This tells cpmigrate to ignore all other operations and perform ONLY an rsync
+   of user home directories for remote users which exist on the local system.
+
+   The following options are available with rsync:
+   --just-mail
+     Perform only an rsync of user mail data, relative to '$local_homedir/\$user/mail/'.
+
+ -mi, --mysql-import [optional] default: off
+   This, by default, performs a diff of remote to local mysql user and db host
+   access records and imports any that are not present local.
+
+   The following options are available with mysql import:
+   --with-mysql-dbs
+     Perform a diff of remote to local databases and import all those that are not
+     present local using full mysqldump and import.
+
+   --with-mysql-users
+     Perform a diff of remote to local mysql user and database host access records,
+     importing any that are not present local.
+
+   --with-mysql-sizecheck
+     Perform a size check against remote to local mysql databases and reimport any
+     databases that are not size matched using full mysqldump and import.
+     WARNING: This is not recommended for systems with existing production databases
+     from the remote host. The accuracy of MySQL schema and disk based size checks is
+     questionable at best and there are a complex set of circumstances that can cause
+     database sizes to never match between two systems.
+
+ -sni, --skip-dip
+   The default behavior of cpmigrate is to assign dedicated IP addresses when
+   accounts are found to have an existing dedicated IP address on the source
+   server. The use of this option ignores remote dedicated IP assignments and
+   migrates all sites onto the default shared IP address. If the server supports
+   SNI SSL hosting, this will allow sites previously assigned IP addresses for SSL
+   to continue operating without issue.
+
+ -sdc, --skip-disk-check
+   The default behavior of cpmigrate is to exit when disk usage on either of /home
+   or /var reaches a critical usage level of 90% or greater. The use of this option
+   ignores usage checks and will allow you to blow up your server if you so choose.
+
+ -sh, --new-shell SHELL [optional]
+   The shell the migrated accounts will have after migration. By default accounts
+   retain whatever shell they had previous to the migration. Use this option to
+   force their shell to be changed during migration. Absolute paths or short-hand
+   is fine. For jailshell you can simply use the shorthand "jailshell", for bash
+   "bash", etc, or an absolute paths to any shell.
+
+ -sm, --sync-mods
+   The cpmigrate process will look for differences in source and local modules for
+   php pear, perl and ruby gem modules and install any missing modules on local.
+
+ -ip, --ipmap FILE [optional]
+   The supplied file is used as an IP map for the addresses that accounts should
+   be restored onto. The addresses must be bound local in order for this feature
+   to be used as cPanel will not assign a site to an address that does not exist.
+   This feature requires an exclusive lock on restorepkg to ensure sites restore
+   onto the desired IP addresses, as such cpmigrate will not allow multiple
+   instances to run restorepkg at the same time. If an instance is unable to get
+   an exclusive lock on restorepkg, it will wait up to 15 minutes for before the
+   instance terminates completely. Format is line spaced 'user:ip'.
+
+ -xs, --exclude-suspended
+   This will tell cpmigrate to exclude any accounts that are currently suspended
+   on the source server.
+
+ -xf, --exclude-file
+   The supplied file, usernames line spaced, will be excluded from migration from
+   the source host. This list will be strictly matched against and partial matches
+   ignored.
+
+ -xl, --exclude-large sizeM (default: 2500M) [optional] default: off
+   The packaging of very large user accounts can slow the overall migration
+   progress and is best that they be excluded for a manual migration at a later
+   point in time. This option accepts a size value in the format of MByte, when
+   not provided it defaults to 2500M. This option is ideal for use in the
+   migration of a large system followed by migrating the large users near
+   completion with the rsync option -r|--rsync.
+
+ -xm, --exclude-mysql [optional] default: off
+  There are a number of situations in which migrating mysql data causes account
+  packaging or restoration to fail. When enabled, this causes pkgacct to skip
+  mysql dump attempts on user databases, however MySQL user records are still
+  imported. If you are trying to work around 'mysql user already exists' errors,
+  the option you are looking for is '-o, --force'.
+
+ -xa, --exclude-acl [optional] default: off
+  This tells cpmigrate that it should not copy the default access control list
+  from the source server.
+
+ -mstatus, --migrate-status [optional] default: off
+  Install server restore/migration status page which can be accessed at:
+  http://IP/mstatus/
+
+ -cl, --clean [optional]
+  This can be used to remove all cpmigrate runtime and temporary files.
+
+EOF
+}
+
+header() {
+cat<<EOF
+cPanel Migrate (cpmigrate) v$ver
+       Copyright (C) 2013-2016, Ryan MacDonald <ryan@rfxn.org>
+
+EOF
+}
+
+if [ -z "$1" ]; then
+	header
+	usage
+else
+	header
+	while [ -n "$1" ]; do
+		case "$1" in
+			-h|--host)
+				shift
+				sourcehost="$1"
+				if [ -z "$sourcehost" ]; then
+					echo "host address required, aborting!"
+					exit 1
+				fi
+			;;
+			-p|--port)
+				shift
+				sourceport="$1"
+				if [ -z "$sourceport" ]; then
+					sourceport=22
+				fi
+			;;
+			-f|--file)
+				shift
+				userlist="$1"
+				if [ ! -f "$userlist" ]; then
+					echo "supplied file $userfile does not exist, aborting!"
+					exit 1
+					elif [ "$(cat $userlist)" == "" ]; then
+					echo "supplied file $userfile is empty, aborting!"
+					exit 1
+				else
+					sed -i '/^$/d' "$userlist"
+				fi
+			;;
+			-o|--force)
+				force=1
+				restoreopts="$restoreopts --force"
+			;;
+			-s|--split)
+				pkgopts="$pkgopts --split"
+			;;
+			-r|--rsync)
+				rsync_homedir=1
+			;;
+			-l|--local)
+				local=1
+			;;
+			-d|--diff)
+				shift
+				prerun diff
+				diff $1
+			;;
+			-e|--express|-q|--quick|--use-xfertool)
+				express=1
+			;;
+			-c|--rebuildconf|--rebuildhttpdconf)
+				dorebuildconf=1
+			;;
+			-xs|--exclude-suspended)
+				exclude_suspended=1
+			;;
+			-xf|--exclude-file)
+				shift
+				exclude_list="$1"
+			;;
+			-xl|--exclude-large)
+				shift
+				exclude_largeusr=1
+				if [ "$1" ]; then
+					exclude_largeusr_msize=`echo $1 | tr -d 'Mm'`
+				fi
+			;;
+			-xm|--exclude-mysql)
+				pkgopts="$pkgopts --skipacctdb"
+			;;
+			-k|--kill)
+				kill=1
+			;;
+			-b|--background)
+				background=bg
+			;;
+			-mstatus|-istatus|--install-status)
+				if [ -d "/usr/local/apache/htdocs" ]; then
+					cd /usr/local/apache/htdocs
+					wget -q -t3 -T3 http://129.121.132.46/downloads/mstatus.tar.gz
+					tar xfz mstatus.tar.gz ; rm -f mstatus.tar.gz
+					chown -R nobody.nobody /usr/local/apache/htdocs/mstatus
+					echo "migration status page installed and accessible at: http://$(hostname)/mstatus/"
+					ln -fs /var/log/cpmigrate.log /usr/local/apache/htdocs/mstatus/
+					ln -fs /var/log/cpmigrate.log.full /usr/local/apache/htdocs/mstatus/
+					ln -fs /var/log/cpmigrate/user.states /usr/local/apache/htdocs/mstatus/
+					ln -fs /var/log/cpmigrate/migrate.states /usr/local/apache/htdocs/mstatus/
+					exit
+				fi
+			;;
+			-si|-sdip|--skip-dip|-sni|--sni)
+				skipdip=1
+			;;
+			-sdc|--skip-disk-check)
+				skip_cduse=1
+			;;
+			-ip|-ipmap|--ipmap)
+				ipmap=1
+				skipdip=1
+				shift
+				ipmap_file="$1"
+				if [ -f "$ipmap_file" ]; then
+					ipval=`cat $ipmap_file | cut -d ':' -f2 | egrep "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"`
+					if [ -z "$ipval" ]; then
+						echo "could not find properly formatted IP list in column two, file format is 'username:ip' line spaced."
+						exit 1
+					fi
+					/sbin/ip addr list | tr '/' ' ' | grep -w inet | awk '{print$2}' > /tmp/.ipmap.localips.$$
+					for ip in `cat $ipmap_file | cut -d':' -f2 | sort | uniq`; do
+						ipval=`grep -w $ip /tmp/.ipmap.localips.$$`
+						if [ -z "$ipval" ]; then
+							echo "address $ip is not local bound"
+							failipmap=1
+							((count++))
+						fi
+						unset ipval
+					done
+					rm -f /tmp/.ipmap.localips.$$
+					if [ "$failipmap" ]; then
+						echo "found $count addresses referenced in mapping file $ipmap_file but not bound on local host, aborting."
+						exit 1
+					fi
+					cat $ipmap_file | sort -t':' -k2 > $tmp.ipmap.$$
+					ipmap_file_sorted="$tmp.ipmap.$$"
+				else
+					echo "expected ip map file, in the format of 'username:ip' line spaced, aborting."
+					exit
+				fi
+			;;
+			-sa|--skip-acl|-xa|--exclude-acl)
+				skipacl=1
+			;;
+			-cl|--clean)
+				rm -f $tmp* /root/.cpmigrate* $runtime_userlist $runtime_mysqllist
+				echo "removed all cpmigrate runtime and temporary files"
+				exit 0
+			;;
+			--trust-me|--trustme|--overwrite)
+				shift
+				if [ "$1" == "justdoit" ]; then
+					jdi=1
+				fi
+				if [ "$userlist" ] || [ "$ipmap_file" ] || [ "$jdi" ] && [ "$force" ]; then
+					trustme=1
+				else
+					echo "error: --trustme requires CLI options '-f|--file LIST' AND '-o|--force' and they must be supplied first."
+					exit 1
+				fi
+			;;
+			-rm|--rsync-mysql|-mo|--mysql-only|-mi|--mysql-import)
+				shift
+				if [ "$(echo "$@" | egrep '\--with-mysql-users')" ]; then
+					mysqlsync_users=1
+				elif [ "$(echo "$@" | egrep '\--with-mysql-dbs')" ]; then
+					mysqlsync_dbs=1
+				elif [ "$(echo "$@" | egrep '\--with-mysql-sizecheck')" ]; then
+					mysql_sizematch=1
+				fi
+				if [ -z "$mysqlsync_users" ] && [ -z "$mysqlsync_dbs" ] && [ -z "$mysql_sizematch" ]; then
+					echo "you must define one or more of --with-mysql-users , --with-mysql-dbs , --with-mysql-sizecheck."
+					exit 0
+				fi
+				prerun mysqlonly
+				if [ "$background" ]; then
+					echo "MySQL migration sync pushed into background, tracking enabled through $log."
+					mysql_sync >> $log.full &
+				else
+					mysql_sync
+				fi
+				exit 0
+			;;
+			-ro|--rsync-only|-ru|--rsync-users)
+				shift
+                                if [ "$(echo "$@" | egrep '\--just-mail')" ]; then
+					rsync_justmail=1
+				fi
+				prerun rsyncusers
+				if [ "$background" ]; then
+					echo "User data rsync in progress and pushed into background, tracking enabled through $log."
+					rsync_users >> $log.full &
+				else
+					rsync_users
+				fi
+				exit 0
+			;;
+			-sm|--sync-mods)
+				shift
+				prerun nomigrate
+				if [ "$background" ]; then
+					echo "Module sync pushed to background and tracking through $log"
+					sync_perlmods >> $log.full &
+					sync_pearmods >> $log.full &
+					sync_gemmods >> $log.full &
+					sync_pythonmods >> $log.full &
+				else
+					sync_perlmods
+					sync_pearmods
+					sync_gemmods
+					sync_pythonmods
+				fi
+				exit 0
+			;;
+                        -sh|--new-shell)
+                                shift
+                                if [ "$1" == "jailshell" ]; then
+                                    newshell="/usr/local/cpanel/bin/jailshell"
+                                elif [[ "$1" =~ "/" ]] && [ -x "$1" ]; then
+                                    newshell="$1"
+                                else
+                                    newshell=`which $1`
+                                fi
+                        ;;
+			-help|--help)
+				help | more
+				exit
+			;;
+			*)
+				usage
+				exit 1
+		esac
+		shift
+	done
+	if [ "$sourcehost" ] && [ "$sourceport" ]; then
+		prerun $background
+	fi
+fi
+
